@@ -1,6 +1,7 @@
 package relyingparty
 
 import (
+	"os"
 	"fmt"
 	"bytes"
 	"context"
@@ -50,10 +51,22 @@ func parseRelyingPartyConfig(fileName string) (*RelyingPartyConfig, error){
 
 //creates and returns a new Relying party type
 func NewRelyingParty(logListName string, monitorListName string, configFileName string) (*RelyingParty, error){
-	logList, err := entitylist.NewLogList(logListName)
+	jsonFile, err := os.Open(logListName)
+	defer jsonFile.Close()
+	if err != nil {
+		return nil, fmt.Errorf("error opening file: %v", err)
+	}
+	//fmt.Printf("Successfully Opened %s\n", logListName)	// TODO Replace with log later
+	byteData, err := ioutil.ReadAll(jsonFile)
+	if err != nil {
+		return nil, fmt.Errorf("error opening %s to create new LogList: %w", logListName, err)
+	}
+	logList, err := entitylist.NewLogListFromJSON(byteData)
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to create loglist for relying party: %w", err)
 	}
+
 	monitorList, err := entitylist.NewMonitorList(monitorListName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create monitorlist for relying party: %w", err)
@@ -69,46 +82,39 @@ func NewRelyingParty(logListName string, monitorListName string, configFileName 
 	return rp, nil
 }
 
-//function that takes in a montorID and a loggerID, then
-//	1. Querrys the logger with that ID for an STH, a cert and the PoI for that cert
-//	2. Veryfiers both that the signature on the STH is valid, and that the PoI is valid
-//	3. Sends the sth to the monitor with that ID, to audit it
-func (rp *RelyingParty) QueryVerifyAndAudit(logID string, monID string) (error){
-	//Query
-	log := rp.LogList.FindLogByLogID(logID) //get logger from list of all loggers
-	if log == nil { // if logger is not found return an error
-		return fmt.Errorf("logger with id '%v' not found", logID)
+func (rp *RelyingParty) Query(log *entitylist.LogInfo) (*mtr.CTObject, error) {
+	logClient, err := mtr.NewLogClient(log) // create a logClient from the logger
+	if err != nil { //report error if there is one
+		return nil, fmt.Errorf("failed to create logClient: %v", err)
 	}
+	ctx := context.Background()
+	sth, err := logClient.GetSTH(ctx) //get the STH from the logger
+	if err != nil { //report error if there is one
+		return nil, fmt.Errorf("failed to get STH from logger: %v", err)
+	}
+	return sth, nil
+}
+
+func (rp *RelyingParty) Verify(log *entitylist.LogInfo, sth *mtr.SignedTreeHeadData) (error){
 	logClient, err := mtr.NewLogClient(log) // create a logClient from the logger
 	if err != nil { //report error if there is one
 		return fmt.Errorf("failed to create logClient: %v", err)
 	}
 	ctx := context.Background()
-	sth, err := logClient.GetSTH(ctx) //get the STH from the logger
-	if err != nil { //report error if there is one
-		return fmt.Errorf("failed to get STH from logger: %v", err)
-	}
-
-	//Verify STH
-	blob, err := sth.DeconstructSTH() //convert STH as a CTObject struct to a SignedTreeHeadData struct
-	if err != nil { //report error if there is one
-		return fmt.Errorf("Error deconstructing STH\n")
-	}
-
-	err = signature.VerifySignature(log.Key, blob.TreeHeadData, blob.Signature) //verify the signature over the STH, using the loggers public key
-	if err != nil { //report error if there is one
-		return fmt.Errorf("Signature Invalid\n")
-	}
-
-	//Verify PoI
-
 	rand.Seed(time.Now().Unix())
 	randIndex := rand.Intn(len(rp.LogIDs)-1)+1 //choose a random index, to get a random cert from the logger
-	poi, leafInput, err := logClient.GetEntryAndProof(ctx, uint64(randIndex), blob.TreeHeadData.TreeSize) //get the cert and the PoI from the logger
+	poi, leafInput, err := logClient.GetEntryAndProof(ctx, uint64(randIndex), sth.TreeHeadData.TreeSize) //get the cert and the PoI from the logger
 	if err != nil { //report error if there is one
 		return fmt.Errorf("Error getting PoI and Cert %v\n", err)
 	}
 
+	//Verify STH
+	err = signature.VerifySignature(log.Key, sth.TreeHeadData, sth.Signature) //verify the signature over the STH, using the loggers public key
+	if err != nil { //report error if there is one
+		return fmt.Errorf("Signature Invalid: %v", err)
+	}
+
+	//Verify PoI
 	verifier := logverifier.New(hasher.DefaultHasher) //struct for verifying proofs
 
 	ret := ct.RawLogEntry{Index: 3}
@@ -120,41 +126,15 @@ func (rp *RelyingParty) QueryVerifyAndAudit(logID string, monID string) (error){
 
 	//verify that the PoI proves the cert is in the STH
 	//VerifyInclusionProof returns nil, if PoI is valid
-	err = verifier.VerifyInclusionProof(int64(randIndex), int64(blob.TreeHeadData.TreeSize), poi.InclusionPath, blob.TreeHeadData.SHA256RootHash[:], leafHash[:])
+	err = verifier.VerifyInclusionProof(int64(randIndex), int64(sth.TreeHeadData.TreeSize), poi.InclusionPath, sth.TreeHeadData.SHA256RootHash[:], leafHash[:])
 	if err != nil { //report error if there is one
 		return fmt.Errorf("Error verifying PoI for Cert %v\n", err)
 	}
-
-	//print info for debug
-	fmt.Printf("poi: %v\nleafInput: %v\n", poi, leafInput)
-
-	//Audit
-	monitor := rp.MonitorList.FindMonitorByMonitorID(monID) //get the monitor from the monitorID
-
-	//print info for debug
-	fmt.Printf("http://%v%v\n", monitor.MonitorURL, mtr.AuditPath)
-
-	//send the STH to the monitor
-	//only for debugging
-	newinfo(fmt.Sprintf("http://%v%v", monitor.MonitorURL, mtr.NewInfoPath), sth)
-
-	//uncomment the next line to test gettign a PoM from the monitor if the digest is wrong
-	//sth.Digest = []byte{0,1,2,3};
-
-	auditOK, err := audit(fmt.Sprintf("http://%v%v", monitor.MonitorURL, mtr.AuditPath), sth) //send STH to monitor to be audited and capture the response
-
-	if err != nil { //report error if there is one
-		return fmt.Errorf("error auditing monitor %v", err)
-	}
-
-	//print info for debug
-	fmt.Printf("auditOK: %v\n",auditOK)
-
-	return nil //if no error have been thrown, everythin went well, return no errors
+	return nil
 }
 
 // function to send an STH to a monitor to be audited, and returs the output as an AuditOK struct
-func audit(address string, toSend *mtr.CTObject) (*mtr.AuditOK, error){
+func (rp *RelyingParty) Audit(address string, toSend *mtr.CTObject) (*mtr.AuditOK, error){
 	var jsonStr, _ = json.Marshal(toSend); //create JSON string for the CTObject
 
 	req, err := http.NewRequest("POST", address, bytes.NewBuffer(jsonStr)); //create a post request
@@ -169,11 +149,11 @@ func audit(address string, toSend *mtr.CTObject) (*mtr.AuditOK, error){
 	defer resp.Body.Close();
 
 	//print info for debug
-	fmt.Println("response Status:", resp.Status);
-	fmt.Println("response Headers:", resp.Header);
+	//fmt.Println("response Status:", resp.Status);
+	//fmt.Println("response Headers:", resp.Header);
 	body, _ := ioutil.ReadAll(resp.Body);
-	sbody := string(body);
-	fmt.Println("response Body:", sbody);
+	//sbody := string(body);
+	//fmt.Println("response Body:", sbody);
 
 	var auditOK mtr.AuditOK
 	err = json.Unmarshal(body, &auditOK)
@@ -181,6 +161,54 @@ func audit(address string, toSend *mtr.CTObject) (*mtr.AuditOK, error){
 		return nil, fmt.Errorf("error reading response from post request %v", err);
 	}
 	return &auditOK, nil
+}
+
+//function that takes in a montorID and a loggerID, then
+//	1. Querrys the logger with that ID for an STH, a cert and the PoI for that cert
+//	2. Veryfiers both that the signature on the STH is valid, and that the PoI is valid
+//	3. Sends the sth to the monitor with that ID, to audit it
+func (rp *RelyingParty) QueryVerifyAndAudit(logID string, monID string) (*mtr.AuditOK, error){
+	//Query
+	log := rp.LogList.FindLogByLogID(logID) //get logger from list of all loggers
+	if log == nil { // if logger is not found return an error
+		return nil, fmt.Errorf("logger with id '%v' not found", logID)
+	}
+	sth, err := rp.Query(log)
+	if err != nil { //report error if there is one
+		return nil, fmt.Errorf("Error querying the logger: %v", err)
+	}
+
+	blob, err := sth.DeconstructSTH() //convert STH as a CTObject struct to a SignedTreeHeadData struct
+	if err != nil { //report error if there is one
+		return nil, fmt.Errorf("Error deconstructing STH: %v", err)
+	}
+
+	//Verify
+	err = rp.Verify(log, blob)
+	if err != nil { //report error if there is one
+		return nil, fmt.Errorf("Error verifing the sth and PoI: %v", err)
+	}
+
+	//Audit
+	monitor := rp.MonitorList.FindMonitorByMonitorID(monID) //get the monitor from the monitorID
+
+	//send the STH to the monitor
+	//only do this if the monitor will not be updated by any other sources
+	newinfo(fmt.Sprintf("http://%v%v", monitor.MonitorURL, mtr.NewInfoPath), sth)
+
+	//uncomment the next line to test getting a PoM from the monitor if the digest is wrong
+	//sth.Digest = []byte{0,1,2,3};
+
+	auditOK, err := rp.Audit(fmt.Sprintf("http://%v%v", monitor.MonitorURL, mtr.AuditPath), sth) //send STH to monitor to be audited and capture the response
+
+	if err != nil { //report error if there is one
+		return nil, fmt.Errorf("error auditing monitor %v", err)
+	}
+
+	//print info for debug
+	//fmt.Printf("auditOK: %v\n",auditOK)
+
+	return auditOK, nil //if no error have been thrown, everythin went well, return no errors
 }
 
 // only for debbuging
@@ -200,11 +228,11 @@ func newinfo(address string, toSend *mtr.CTObject){
 	defer resp.Body.Close();
 
 	//print info for debug
-	fmt.Println("response Status:", resp.Status);
-	fmt.Println("response Headers:", resp.Header);
-	body, _ := ioutil.ReadAll(resp.Body);
-	sbody := string(body);
-	fmt.Println("response Body:", sbody);
+	//fmt.Println("response Status:", resp.Status);
+	//fmt.Println("response Headers:", resp.Header);
+	//body, _ := ioutil.ReadAll(resp.Body);
+	//sbody := string(body);
+	//fmt.Println("response Body:", sbody);
 }
 
 // helper function to get a random LoggerID

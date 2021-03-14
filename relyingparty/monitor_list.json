@@ -9,12 +9,6 @@
             "monitor_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2HQc8jcuoOj/H/4+HQItNBEolurr547rC5i4O61Wf0mxvV9anHz+kIcTy7n9hnStoK+WGkI3fF6k7l2IO3OiyA==",
             "monitor_url": "localhost:8080",
             "gossiper_url": "http://localhost:4500"
-          },
-          {
-            "monitor_id": "monitor2",
-            "monitor_key": "aaabbbcccddd",
-            "monitor_url": "monitor2.com",
-            "gossiper_url": "http://localhost:5500"
           }
         ]
       }
