@@ -155,12 +155,26 @@ func (rp *RelyingParty) Audit(address string, toSend *mtr.CTObject) (*mtr.AuditO
 	//sbody := string(body);
 	//fmt.Println("response Body:", sbody);
 
-	var auditOK mtr.AuditOK
-	err = json.Unmarshal(body, &auditOK)
+	var auditOKCTObject mtr.CTObject
+	err = json.Unmarshal(body, &auditOKCTObject)
 	if err != nil { //report error if there is one
 		return nil, fmt.Errorf("error reading response from post request %v", err);
 	}
-	return &auditOK, nil
+
+	if auditOKCTObject.TypeID == mtr.STHAuditOKTypeID { //if returned object is an audit ok return it
+		auditOK, err := auditOKCTObject.DeconstructAuditOK();
+		if err != nil { //report error if there is one
+			return nil, fmt.Errorf("error reading response from post request %v", err);
+		}
+		return auditOK, nil;
+	}
+	if auditOKCTObject.TypeID == mtr.ConflictingSTHPOMTypeID { //if returned object is a PoM error
+		return nil, fmt.Errorf("Audit failed Conflicting STH PoM raised");
+	}
+	if auditOKCTObject.TypeID == mtr.ConflictingSRDOMTypeID { //if returned object is a PoM error
+		return nil, fmt.Errorf("Audit failed Conflicting SRD PoM raised");
+	}
+	return nil, fmt.Errorln("Invalid type returned from monitor during audit");
 }
 
 //function that takes in a montorID and a loggerID, then
